@@ -1,0 +1,180 @@
+- name: KUBERNETES - 1 MASTER
+  hosts: k8s-master-1
+  become: yes
+  tasks:
+    - name: Ping
+      ping:
+
+    - name: Install iptables
+      block:
+        - name: Install iptables package
+          yum:
+            name: iptables-services
+            state: latest
+
+        - name: Start `iptables` service
+          systemd: 
+            name: iptables
+            enabled: yes
+            state: started
+
+        - name: Replace `iptables` content (DO NOT USE THIS ON PRODUCTION)
+          copy:
+            dest: /etc/sysconfig/iptables
+            content: |
+              *filter
+              :INPUT ACCEPT [0:0]
+              :FORWARD ACCEPT [0:0]
+              :OUTPUT ACCEPT [0:0]
+              -A INPUT -j ACCEPT
+              -A OUTPUT -j ACCEPT
+              -A FORWARD -j ACCEPT
+              -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+              -A INPUT -p icmp -j ACCEPT
+              -A INPUT -i lo -j ACCEPT
+              -A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+              -A INPUT -j REJECT --reject-with icmp-host-prohibited
+              -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+              COMMIT
+
+        - name: Reload `iptables`
+          systemd:
+            name: iptables
+            state: restarted
+
+    - name: Install Docker
+      block:
+        - name: Docker's system dependencies
+          yum:
+            state: latest
+            name:
+              - yum-utils
+              - device-mapper-persistent-data
+              - lvm2
+
+        - name: Configure Docker's CE Stable repo
+          yum_repository:
+            name: docker-ce-stable
+            description: Docker CE Stable - $basearch
+            baseurl: https://download.docker.com/linux/centos/7/$basearch/stable
+            gpgkey: https://download.docker.com/linux/centos/gpg
+            enabled: yes
+            gpgcheck: yes
+            state: present
+
+        - name: Install Docker package
+          yum:
+            name: "docker-ce-18.06.1.ce"
+            state: latest
+
+        - name: Enable and Start Docker
+          systemd:
+            name: docker
+            enabled: yes
+            state: started
+
+        - name: Copy `daemon.json`
+          copy:
+            dest: /etc/docker/daemon.json
+            content: |
+              {
+                "iptables": false
+              }
+
+        - name: Restart Docker
+          systemd:
+            name: docker
+            state: restarted
+
+    - name: Install Kubernetes
+      block:
+        - name: Install Kubernetes repo
+          yum_repository: 
+            name: Kubernetes
+            description: Kubernetes Stable - $basearch
+            baseurl: https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+            gpgkey: https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+            enabled: yes
+            gpgcheck: yes
+            repo_gpgcheck: yes
+            state: present
+
+        - name: Install `kube*`
+          yum:
+            state: present
+            name:
+              - kubeadm-1.12.2
+              - kubelet-1.12.2
+              - kubectl-1.12.2
+
+    - name: System tuning
+      block:
+        - name: Disable swap and SELinux
+          shell: "{{ item }}"
+          with_items:
+            - swapoff -a
+            - setenforce 0
+          ignore_errors: yes
+
+        - name: Load Kernel modules
+          modprobe:
+            name: br_netfilter
+            state: present
+
+        - name: Reload sysctl
+          sysctl:
+            name: "{{ item.key }}"
+            value: "{{ item.value }}"
+            reload: yes
+            sysctl_set: yes
+            state: present
+          with_dict:
+              net.bridge.bridge-nf-call-ip6tables: 1
+              net.bridge.bridge-nf-call-iptables: 1
+              net.bridge.bridge-nf-call-arptables: 1
+              net.ipv4.ip_forward: 1
+
+        - name: Turn off swap in the next restart
+          replace:
+            path: /etc/fstab
+            regexp: "^(.*)swap(.*)$"
+            replace: "#\\1swap\\2"
+
+    - name: Initialize cluster
+      vars:
+        kubeadm_init_yml: /kubeadm.init.yml
+      block:
+        - name: Generate configuration file
+          copy:
+            dest: "{{ kubeadm_init_yml }}"
+            content: |
+                apiVersion: kubeadm.k8s.io/v1alpha3
+                kind: InitConfiguration
+                nodeRegistration:
+                  name: k8s-master-1
+                  kubeletExtraArgs:
+                    node-ip: 192.168.33.10
+                apiEndpoint:
+                  advertiseAddress: 192.168.33.10
+                  port: 6443
+                ---
+                apiVersion: kubeadm.k8s.io/v1alpha3
+                kind: ClusterConfiguration
+                kubernetesVersion: v1.12.2
+                clusterName: k8s-1m
+                controlPlaneEndpoint: 192.168.33.10:6443
+
+        - name: Initialize cluster
+          shell: kubeadm init --config={{ kubeadm_init_yml }}
+
+        - name: Post-processing
+          shell: "{{ item }}"
+          with_items:
+            - rm -rf $HOME/.kube
+            - mkdir -p $HOME/.kube
+            - sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+            - sudo chown $(id -u):$(id -g) $HOME/.kube/config
+            - export KUBECONFIG=/etc/kubernetes/admin.conf
+
+        - name: Weave network
+          shell: kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"
